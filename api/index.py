@@ -1,111 +1,108 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import os
-import asyncio
 import requests
 import json
-import time
 
 app = Flask(__name__)
-CORS(app) # 🔥 ይሄ ነው Frontend እንዲገባ የሚፈቅደው!
+CORS(app)
 
-# --- CONFIG ---
-TOKEN = os.environ.get('BOT_TOKEN')
+# --- VERCEL KV CONFIG ---
+# Vercel ላይ Storage > Connect ሲደረግ እነዚህ በራስ ሰር ይገባሉ
 KV_URL = os.environ.get('KV_REST_API_URL')
 KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
-FRONTEND_URL = "https://net-ui-iota.vercel.app"
 
-# --- HELPER ---
-def kv_get(key):
-    if not KV_URL or not KV_TOKEN: return None
+# --- DB HELPER FUNCTIONS ---
+def db_read(key):
+    if not KV_URL or not KV_TOKEN:
+        print("❌ Error: Database Creds Missing")
+        return None
+    
     try:
-        res = requests.get(f"{KV_URL}/get/{key}", headers={"Authorization": f"Bearer {KV_TOKEN}"})
-        data = res.json()
+        # Upstash/Vercel KV REST API: GET /get/<key>
+        response = requests.get(
+            f"{KV_URL}/get/{key}",
+            headers={"Authorization": f"Bearer {KV_TOKEN}"}
+        )
+        data = response.json()
+        
+        # Redis returns data in 'result' field as a string
         if 'result' in data and data['result']:
-            return json.loads(data['result'])
-    except: return None
-    return None
+            return json.loads(data['result']) # String ወደ JSON እንቀይራለን
+        return None
+    except Exception as e:
+        print(f"❌ DB Read Error: {e}")
+        return None
 
-def kv_set(key, value):
-    if not KV_URL or not KV_TOKEN: return
+def db_write(key, value_dict):
+    if not KV_URL or not KV_TOKEN:
+        return False
+    
     try:
-        requests.post(f"{KV_URL}/set/{key}", headers={"Authorization": f"Bearer {KV_TOKEN}"}, json=value)
-    except: pass
+        # Upstash/Vercel KV REST API: POST /set/<key>
+        # Value must be a string
+        value_str = json.dumps(value_dict)
+        response = requests.post(
+            f"{KV_URL}/set/{key}",
+            headers={"Authorization": f"Bearer {KV_TOKEN}"},
+            data=value_str
+        )
+        return True
+    except Exception as e:
+        print(f"❌ DB Write Error: {e}")
+        return False
 
 # --- ROUTES ---
+
 @app.route('/')
 def home():
-    status = "Connected ✅" if KV_URL else "Not Connected ❌ (Check Vercel Envs)"
-    return f"Backend Live. Database: {status}", 200
+    if KV_URL:
+        return "✅ Backend & Vercel KV Connected!", 200
+    return "❌ Database Not Connected (Check Vercel Storage Tab)", 500
 
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
 def handle_user(user_id):
-    # Get or Create User
-    user = kv_get(f"user:{user_id}")
-    if not user:
-        user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
-        kv_set(f"user:{user_id}", json.dumps(user))
-    
+    # 1. መረጃ ለማምጣት (GET)
+    current_data = db_read(f"user:{user_id}")
+
+    # 2. ሰውየው ከሌለ እንፍጠረው (Guest)
+    if not current_data:
+        current_data = {
+            "user_id": user_id,
+            "first_name": "Guest",
+            "balance": 0.00,
+            "today_ads": 0
+        }
+        db_write(f"user:{user_id}", current_data)
+
+    # 3. መረጃ ለመቀየር (POST - ከ Frontend ሲመጣ)
     if request.method == 'POST':
-        # Update Info from Frontend
-        data = request.json
-        user['first_name'] = data.get('first_name', user['first_name'])
-        user['photo_url'] = data.get('photo_url', user.get('photo_url', ''))
-        kv_set(f"user:{user_id}", json.dumps(user))
-    
-    return jsonify(user)
+        new_data = request.json
+        # አዲሱን መረጃ ካለፈው ጋር አዋህድ (Merge)
+        current_data.update(new_data)
+        db_write(f"user:{user_id}", current_data)
+        return jsonify({"status": "updated", "data": current_data})
+
+    return jsonify(current_data)
 
 @app.route('/api/add_balance', methods=['POST'])
 def add_balance():
-    data = request.json
-    uid = str(data.get('user_id'))
-    amount = float(data.get('amount'))
+    req = request.json
+    uid = str(req.get('user_id'))
+    amount = float(req.get('amount'))
+
+    user = db_read(f"user:{uid}")
     
-    user = kv_get(f"user:{uid}")
-    if not user: 
-        user = {"user_id": uid, "first_name": "User", "balance": 0.00}
+    if user:
+        user['balance'] = round(user.get('balance', 0) + amount, 2)
+        if amount == 0.50: # ማስታወቂያ ከሆነ
+            user['today_ads'] = user.get('today_ads', 0) + 1
+        
+        db_write(f"user:{uid}", user)
+        return jsonify({"status": "success", "new_balance": user['balance']})
     
-    user['balance'] = round(user.get('balance', 0) + amount, 2)
-    # Track Ad Count
-    if amount == 0.50:
-        user['today_ads'] = user.get('today_ads', 0) + 1
-        user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
+    return jsonify({"error": "User not found"}), 404
 
-    kv_set(f"user:{uid}", json.dumps(user))
-    return jsonify({"status": "success", "new_balance": user['balance']})
-
-# --- TELEGRAM BOT ---
-@app.route('/api/webhook', methods=['POST'])
-def webhook():
-    if request.method == "POST":
-        application = ApplicationBuilder().token(TOKEN).build()
-        
-        async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            u = update.effective_user
-            uid = str(u.id)
-            
-            # Register User on Start
-            if not kv_get(f"user:{uid}"):
-                kv_set(f"user:{uid}", json.dumps({"user_id": uid, "first_name": u.first_name, "balance": 0.00}))
-            
-            btn = InlineKeyboardButton("🚀 Open App", web_app={"url": FRONTEND_URL})
-            await update.message.reply_text(f"Welcome {u.first_name}!", reply_markup=InlineKeyboardMarkup([[btn]]))
-
-        application.add_handler(CommandHandler("start", start))
-        
-        async def runner():
-            await application.initialize()
-            update = Update.de_json(request.get_json(force=True), application.bot)
-            await application.process_update(update)
-            await application.shutdown()
-            
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        loop.run_until_complete(runner())
-        return "OK"
-    return "Error"
+# Vercel Serverless Handler
+if __name__ == '__main__':
+    app.run()
