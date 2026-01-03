@@ -15,80 +15,85 @@ CORS(app)
 TOKEN = os.environ.get('BOT_TOKEN')
 KV_URL = os.environ.get('KV_REST_API_URL')
 KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
-FRONTEND_URL = "https://net-ui-iota.vercel.app" # ያንተ Frontend Link
+FRONTEND_URL = "https://net-ui-iota.vercel.app"
 
-# --- 🔥 THE PIPELINE FIX (Database Engine) 🔥 ---
+# --- 🔥 THE FIXED DATABASE ENGINE (PIPELINE) 🔥 ---
 def kv_execute(command, key, value=None):
-    if not KV_URL or not KV_TOKEN: return None
+    if not KV_URL or not KV_TOKEN: 
+        print("❌ KV Env Vars Missing")
+        return None
     
     try:
-        # ትዕዛዙን አዘጋጅ ["SET", "key", "value"] or ["GET", "key"]
-        cmd_list = [command, key]
+        # Construct Command
+        cmd = [command, key]
         if value is not None:
-            cmd_list.append(json.dumps(value)) # Value must be stringified JSON
+            cmd.append(json.dumps(value)) # Serialize JSON to string
 
+        # Send Request
         response = requests.post(
             f"{KV_URL}/pipeline",
             headers={
                 "Authorization": f"Bearer {KV_TOKEN}",
                 "Content-Type": "application/json",
             },
-            json={"commands": [cmd_list]}
+            json={"commands": [cmd]},
+            timeout=10
         )
         
-        # Response Parsing (Upstash Pipeline returns list of results)
         data = response.json()
         
-        # Extract the result inside the list
-        # Result format: [{"result": "..."}]
-        if data and isinstance(data, list) and len(data) > 0:
-            result = data[0].get("result")
-            if result:
-                # If it's a GET command, we need to parse the JSON string back to Dict
-                if command == "GET":
-                    return json.loads(result)
-                return result
+        # ✅ CORRECT PARSING LOGIC (Thanks to ChatGPT fix)
+        # Upstash returns: { "result": [ { "result": "..." } ] }
+        if "result" in data and len(data["result"]) > 0:
+            inner_result = data["result"][0].get("result")
+            
+            if inner_result is None:
+                return None
                 
+            if command == "GET":
+                return json.loads(inner_result) # Parse JSON string back to Dict
+            
+            return inner_result # For SET, usually returns "OK"
+            
     except Exception as e:
-        print(f"KV Error ({command}): {e}")
+        print(f"❌ KV Error ({command}): {e}")
     
     return None
 
-# Wrappers for easier usage
-def db_get(key):
-    return kv_execute("GET", key)
-
-def db_set(key, value):
-    return kv_execute("SET", key, value)
+# Wrappers
+def db_get(key): return kv_execute("GET", key)
+def db_set(key, value): return kv_execute("SET", key, value)
 
 # --- ROUTES ---
 
 @app.route('/')
 def home():
-    status = "Connected ✅" if KV_URL else "Disconnected ❌"
-    return f"RiyalNet Backend Live. DB Status: {status}", 200
+    return "RiyalNet Backend Live with FIXED KV Logic! 🚀", 200
 
-# 1. USER HANDLING
+# 🔥 DEBUG ENDPOINT (To test DB manually) 🔥
+@app.route('/api/debug_kv')
+def debug_kv():
+    test_data = {"status": "Database is Working!", "time": time.time()}
+    db_set("debug:test", test_data)
+    result = db_get("debug:test")
+    return jsonify(result)
+
+# 1. USER
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
 def handle_user(user_id):
-    # Fetch User
     user = db_get(f"user:{user_id}")
     
     if request.method == 'POST':
-        # Update Request
-        req_data = request.json
+        data = request.json
         if not user: 
             user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
-        
-        # Merge new data
-        user.update(req_data)
+        user.update(data)
         db_set(f"user:{user_id}", user)
         return jsonify(user)
     
-    # Get Request
     if not user:
         # Auto-create
-        user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
+        user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0}
         db_set(f"user:{user_id}", user)
         
     return jsonify(user)
@@ -101,22 +106,16 @@ def add_balance():
     amount = float(data.get('amount'))
     
     user = db_get(f"user:{uid}")
-    
     if not user:
-        # Fallback create
         user = {"user_id": uid, "first_name": "User", "balance": 0.00}
     
-    # Update Balance
     user['balance'] = round(user.get('balance', 0) + amount, 2)
     
-    # Track Ads
     if amount == 0.50:
         user['today_ads'] = user.get('today_ads', 0) + 1
         user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
     
-    # Save using PIPELINE
     db_set(f"user:{uid}", user)
-    
     return jsonify({"status": "success", "new_balance": user['balance']})
 
 # 3. TASKS
@@ -125,11 +124,9 @@ def tasks_route():
     if request.method == 'POST':
         new_task = request.json
         new_task['id'] = int(time.time())
-        
-        current_tasks = db_get("global_tasks") or []
-        current_tasks.append(new_task)
-        
-        db_set("global_tasks", current_tasks)
+        current = db_get("global_tasks") or []
+        current.append(new_task)
+        db_set("global_tasks", current)
         return jsonify({"status": "Task Added"})
     else:
         return jsonify(db_get("global_tasks") or [])
@@ -148,7 +145,6 @@ def withdraw_route():
     user['balance'] = round(user['balance'] - amount, 2)
     db_set(f"user:{uid}", user)
     
-    # Add to withdrawals list
     w_list = db_get("withdrawals") or []
     data['status'] = 'Pending'
     data['date'] = str(time.time())
@@ -161,7 +157,7 @@ def withdraw_route():
 def get_withdrawals():
     return jsonify(db_get("withdrawals") or [])
 
-# --- TELEGRAM BOT WEBHOOK ---
+# --- WEBHOOK ---
 @app.route('/api/webhook', methods=['POST'])
 def webhook():
     if request.method == "POST":
@@ -171,7 +167,6 @@ def webhook():
             u = update.effective_user
             uid = str(u.id)
             
-            # Register User via Pipeline
             if not db_get(f"user:{uid}"):
                 db_set(f"user:{uid}", {"user_id": uid, "first_name": u.first_name, "balance": 0.00})
             
