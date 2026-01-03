@@ -16,7 +16,7 @@ KV_URL = os.environ.get('KV_REST_API_URL')
 KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 
 # ⚠️ የ FRONTEND ሊንክ (Frontendን Deploy ካደረግክ በኋላ እዚህ ትሞላዋለህ)
-FRONTEND_URL = "https://riyalnet-ui.vercel.app" 
+FRONTEND_URL = "https://net-ui-iota.vercel.app" 
 
 # Helper: Vercel KV
 def kv_set(key, value):
