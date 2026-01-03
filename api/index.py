@@ -1,7 +1,5 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import os
 import requests
 import json
@@ -15,128 +13,148 @@ TOKEN = os.environ.get('BOT_TOKEN')
 KV_URL = os.environ.get('KV_REST_API_URL')
 KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 FRONTEND_URL = "https://net-ui-iota.vercel.app"
+ADMIN_ID = "8519835529"
 
-# --- 🔥 ROBUST DATABASE ENGINE 🔥 ---
-def run_kv_command(command, *args):
-    """
-    Standard way to talk to Vercel KV (Upstash Redis)
-    Sends ["SET", "key", "value"] directly.
-    """
+# --- 🔥 FIXED DB ENGINE (THE FINAL FIX) 🔥 ---
+def kv_execute(command, key=None, value=None):
     if not KV_URL or not KV_TOKEN:
-        print("❌ DB Error: Missing Env Vars")
+        print("❌ KV ENV MISSING")
         return None
     
     try:
-        payload = [command] + list(args)
+        cmd = [command]
+        if key is not None:
+            cmd.append(key)
+        if value is not None:
+            # Redis stores strings, so we dump JSON
+            cmd.append(json.dumps(value))
+
+        # 🔥 THE FIX IS HERE: json={"commands": [cmd]} (Object, not Array)
         response = requests.post(
-            KV_URL, # Base URL
-            headers={"Authorization": f"Bearer {KV_TOKEN}"},
-            json=payload
+            f"{KV_URL}/pipeline",
+            headers={
+                "Authorization": f"Bearer {KV_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"commands": [cmd]}, 
+            timeout=10
         )
+        
         data = response.json()
         
-        # Check for Redis Errors
-        if 'error' in data:
-            print(f"❌ Redis Error: {data['error']}")
+        # Check if result exists
+        if "result" not in data or not data["result"]:
             return None
             
-        return data.get('result')
+        result = data["result"][0].get("result")
+        
+        # If GET, parse the string back to JSON
+        if command == "GET" and result:
+            return json.loads(result)
+            
+        return result
+
     except Exception as e:
-        print(f"❌ Request Error: {e}")
+        print("❌ KV ERROR:", e)
         return None
 
-# Helpers
-def db_get(key):
-    result = run_kv_command("GET", key)
-    if result:
-        return json.loads(result) # Redis stores strings, we convert back to JSON
-    return None
-
-def db_set(key, value):
-    # Convert JSON object to String before saving
-    value_str = json.dumps(value)
-    return run_kv_command("SET", key, value_str)
+# Wrappers
+def db_get(key): return kv_execute("GET", key)
+def db_set(key, value): return kv_execute("SET", key, value)
 
 # --- ROUTES ---
 
 @app.route('/')
 def home():
-    # Test DB Connection on Home Page
-    test = run_kv_command("PING")
-    status = "Connected ✅" if test == "PONG" else "Disconnected ❌ (Check Vercel Envs)"
-    return f"Backend Live. Database Status: {status}", 200
+    return "RiyalNet Backend Live 🚀", 200
 
-# 1. USER HANDLING
+# 🧪 TEST ENDPOINT (Use this to confirm DB works!)
+@app.route('/api/debug_kv')
+def debug_kv():
+    test_data = {"status": "OK", "timestamp": time.time()}
+    set_res = db_set("debug:test", test_data)
+    get_res = db_get("debug:test")
+    return jsonify({
+        "set_result": set_res, 
+        "get_result": get_res,
+        "message": "If get_result has data, DB IS FIXED! ✅"
+    })
+
+# 1. USER
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
 def handle_user(user_id):
     user = db_get(f"user:{user_id}")
     
     if request.method == 'POST':
-        # Update Info
         data = request.json
-        if not user: user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
+        if not user: 
+            user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
         
-        # Merge updates
-        user['first_name'] = data.get('first_name', user.get('first_name'))
-        user['photo_url'] = data.get('photo_url', user.get('photo_url'))
-        
+        user.update(data)
         db_set(f"user:{user_id}", user)
         return jsonify(user)
     
     if not user:
-        # Create New
         user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0}
         db_set(f"user:{user_id}", user)
         
     return jsonify(user)
 
-# 2. ADD BALANCE (Atomic Logic)
+# 2. ADD BALANCE
 @app.route('/api/add_balance', methods=['POST'])
 def add_balance():
-    try:
-        data = request.json
-        uid = str(data.get('user_id'))
-        amount = float(data.get('amount'))
+    data = request.json
+    uid = str(data.get('user_id'))
+    amount = float(data.get('amount'))
+    
+    user = db_get(f"user:{uid}")
+    if not user:
+        user = {"user_id": uid, "first_name": "User", "balance": 0.00}
+    
+    user['balance'] = round(user.get('balance', 0) + amount, 2)
+    
+    if amount == 0.50:
+        user['today_ads'] = user.get('today_ads', 0) + 1
         
-        user = db_get(f"user:{uid}")
-        if not user:
-            user = {"user_id": uid, "first_name": "User", "balance": 0.00}
-        
-        # Update Balance
-        user['balance'] = round(user.get('balance', 0) + amount, 2)
-        
-        # Track Ads
-        if amount == 0.50:
-            user['today_ads'] = user.get('today_ads', 0) + 1
-            user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
-            
-        # 🔥 SAVE TO DB (CRITICAL STEP) 🔥
-        save_result = db_set(f"user:{uid}", user)
-        
-        if save_result == "OK":
-            return jsonify({"status": "success", "new_balance": user['balance']})
-        else:
-            return jsonify({"error": "Failed to save to DB"}), 500
+    db_set(f"user:{uid}", user)
+    return jsonify({"status": "success", "new_balance": user['balance']})
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# 3. TASKS
-@app.route('/api/tasks', methods=['GET', 'POST'])
-def tasks():
-    if request.method == 'POST':
-        new_task = request.json
-        new_task['id'] = int(time.time())
+# 3. ADMIN ACTION
+@app.route('/api/admin/action', methods=['POST'])
+def admin_action():
+    data = request.json
+    admin_uid = str(data.get('admin_id'))
+    
+    if admin_uid != ADMIN_ID:
+        return jsonify({"error": "Unauthorized"}), 403
         
+    action = data.get('action')
+    
+    if action == "add_task":
         tasks = db_get("global_tasks") or []
+        new_task = data.get('task')
+        new_task['id'] = int(time.time())
         tasks.append(new_task)
-        
         db_set("global_tasks", tasks)
         return jsonify({"status": "Task Added"})
-    else:
-        return jsonify(db_get("global_tasks") or [])
+        
+    elif action == "send_money":
+        target_id = data.get('target_id')
+        amount = float(data.get('amount'))
+        target = db_get(f"user:{target_id}")
+        if target:
+            target['balance'] += amount
+            db_set(f"user:{target_id}", target)
+            return jsonify({"status": "Money Sent"})
+        return jsonify({"error": "Target not found"})
+        
+    return jsonify({"error": "Invalid Action"})
 
-# 4. WITHDRAWAL
+# 4. TASKS & WITHDRAWALS
+@app.route('/api/tasks', methods=['GET'])
+def get_tasks():
+    return jsonify(db_get("global_tasks") or [])
+
 @app.route('/api/withdraw', methods=['POST'])
 def withdraw():
     data = request.json
@@ -147,52 +165,44 @@ def withdraw():
     if not user or user['balance'] < amount:
         return jsonify({"error": "Insufficient funds"}), 400
     
-    user['balance'] = round(user['balance'] - amount, 2)
+    user['balance'] -= amount
     db_set(f"user:{uid}", user)
     
-    # Save Request
     reqs = db_get("withdrawals") or []
-    data['status'] = 'Pending'
-    data['date'] = str(time.time())
+    data['status'] = "Pending"
     reqs.insert(0, data)
     db_set("withdrawals", reqs)
     
-    return jsonify({"status": "success", "new_balance": user['balance']})
+    return jsonify({"status": "success"})
 
 @app.route('/api/admin/withdrawals', methods=['GET'])
 def get_withdrawals():
     return jsonify(db_get("withdrawals") or [])
 
-# --- WEBHOOK ---
+# --- WEBHOOK (RAW REQUESTS) ---
 @app.route('/api/webhook', methods=['POST'])
 def webhook():
-    if request.method == "POST":
-        application = ApplicationBuilder().token(TOKEN).build()
-        
-        async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            u = update.effective_user
-            uid = str(u.id)
-            
-            # Register User if new
-            if not db_get(f"user:{uid}"):
-                db_set(f"user:{uid}", {"user_id": uid, "first_name": u.first_name, "balance": 0.00})
-            
-            btn = InlineKeyboardButton("🚀 Open App", web_app={"url": FRONTEND_URL})
-            await update.message.reply_text(f"Welcome {u.first_name}!", reply_markup=InlineKeyboardMarkup([[btn]]))
-
-        application.add_handler(CommandHandler("start", start))
-        
-        async def runner():
-            await application.initialize()
-            update = Update.de_json(request.get_json(force=True), application.bot)
-            await application.process_update(update)
-            await application.shutdown()
-            
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        loop.run_until_complete(runner())
-        return "OK"
-    return "Error"
+    data = request.get_json(silent=True)
+    if not data or "message" not in data: return "OK"
+    
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    uid = str(msg["from"]["id"])
+    first_name = msg["from"].get("first_name", "User")
+    
+    # Save User
+    if not db_get(f"user:{uid}"):
+        db_set(f"user:{uid}", {"user_id": uid, "first_name": first_name, "balance": 0.00})
+    
+    # Reply
+    payload = {
+        "chat_id": chat_id,
+        "text": f"👋 Welcome {first_name}!",
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "🚀 Open App", "web_app": {"url": FRONTEND_URL}}
+            ]]
+        }
+    }
+    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=payload)
+    return "OK"
