@@ -3,59 +3,69 @@ from flask_cors import CORS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import os
+import asyncio
 import requests
 import json
-import asyncio
+import urllib.parse  # 🔥 አዲሱ እና ወሳኙ መፍትሄ 🔥
 
 app = Flask(__name__)
-# 🔥 ወሳኝ ማስተካከያ: ማንኛውም Frontend እንዲያገኘው ፍቀድ 🔥
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
 # --- CONFIG ---
 TOKEN = os.environ.get('BOT_TOKEN')
 KV_URL = os.environ.get('KV_REST_API_URL')
 KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
-FRONTEND_URL = "https://net-ui-iota.vercel.app" # ያንተን UI ሊንክ እዚህ አስገባ
+FRONTEND_URL = "https://net-ui-iota.vercel.app"
 
-# --- HELPER ---
-def db_req(method, key, value=None):
+# --- HELPER: Vercel KV (THE FIX) ---
+def db_read(key):
     if not KV_URL or not KV_TOKEN: return None
     try:
-        url = f"{KV_URL}/{method}/{key}"
-        headers = {"Authorization": f"Bearer {KV_TOKEN}"}
-        if method == "set":
-            requests.post(url, headers=headers, json=value)
-        else:
-            res = requests.get(url, headers=headers)
-            data = res.json()
-            if 'result' in data and data['result']:
-                return json.loads(data['result'])
-    except Exception as e:
-        print(f"DB Error: {e}")
+        # GET request ትክክል ነበር
+        res = requests.get(f"{KV_URL}/get/{key}", headers={"Authorization": f"Bearer {KV_TOKEN}"})
+        data = res.json()
+        if 'result' in data and data['result']:
+            # Redis string ስለሚመልስ ወደ JSON እንቀይረዋለን
+            return json.loads(data['result'])
+    except: return None
     return None
 
+def db_write(key, value):
+    if not KV_URL or not KV_TOKEN: return
+    try:
+        # 🔥 THE FIX: Value ወደ String ቀይሮ URL Encode ማድረግ 🔥
+        val_str = json.dumps(value) 
+        encoded_val = urllib.parse.quote(val_str)
+        
+        # ትክክለኛው የ Vercel KV አጻጻፍ: /set/key/value
+        url = f"{KV_URL}/set/{key}/{encoded_val}"
+        
+        requests.post(url, headers={"Authorization": f"Bearer {KV_TOKEN}"})
+    except Exception as e:
+        print(f"DB Error: {e}")
+
 # --- ROUTES ---
+
 @app.route('/')
 def home():
-    # Browser ላይ ሲከፈት እንዲታወቅ
-    status = "Connected ✅" if KV_URL else "Not Configured ❌"
-    return jsonify({"status": "Backend Live", "database": status})
+    return "Backend is Running & Database is Fixed! 🚀", 200
 
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
 def handle_user(user_id):
     # 1. Get User
-    user = db_req("get", f"user:{user_id}")
+    user = db_read(f"user:{user_id}")
     
+    # 2. Auto-Create if not exists
     if not user:
-        # Auto-create if not exists
-        user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
-        db_req("set", f"user:{user_id}", json.dumps(user))
+        user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0}
+        db_write(f"user:{user_id}", user)
     
-    # 2. Update (POST)
+    # 3. Update (POST)
     if request.method == 'POST':
         data = request.json
+        # Merge old and new data
         user.update(data)
-        db_req("set", f"user:{user_id}", json.dumps(user))
+        db_write(f"user:{user_id}", user)
     
     return jsonify(user)
 
@@ -65,15 +75,27 @@ def add_balance():
     uid = str(data.get('user_id'))
     amount = float(data.get('amount'))
     
-    user = db_req("get", f"user:{uid}")
-    if user:
-        user['balance'] = round(user.get('balance', 0) + amount, 2)
-        db_req("set", f"user:{uid}", json.dumps(user))
-        return jsonify({"status": "success", "new_balance": user['balance']})
+    # Get User
+    user = db_read(f"user:{uid}")
     
-    return jsonify({"error": "User not found"}), 404
+    if not user:
+        # Fallback create
+        user = {"user_id": uid, "first_name": "User", "balance": 0.00}
+    
+    # Update Balance
+    user['balance'] = round(user.get('balance', 0) + amount, 2)
+    
+    # Track Ads
+    if amount == 0.50:
+        user['today_ads'] = user.get('today_ads', 0) + 1
+        user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
 
-# --- WEBHOOK (Start Command) ---
+    # Save
+    db_write(f"user:{uid}", user)
+    
+    return jsonify({"status": "success", "new_balance": user['balance']})
+
+# --- WEBHOOK ---
 @app.route('/api/webhook', methods=['POST'])
 def webhook():
     if request.method == "POST":
@@ -82,9 +104,10 @@ def webhook():
         async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u = update.effective_user
             uid = str(u.id)
-            # Create user on /start
-            if not db_req("get", f"user:{uid}"):
-                db_req("set", f"user:{uid}", json.dumps({"user_id": uid, "first_name": u.first_name, "balance": 0.00}))
+            
+            # Save User on /start
+            if not db_read(f"user:{uid}"):
+                db_write(f"user:{uid}", {"user_id": uid, "first_name": u.first_name, "balance": 0.00})
             
             btn = InlineKeyboardButton("🚀 Open App", web_app={"url": FRONTEND_URL})
             await update.message.reply_text(f"Welcome {u.first_name}!", reply_markup=InlineKeyboardMarkup([[btn]]))
