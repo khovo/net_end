@@ -6,26 +6,31 @@ import json
 import time
 
 app = Flask(__name__)
-CORS(app)
+# Enable CORS for all domains
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- CONFIG ---
-# Vercel Environment Variables ላይ ማስገባት እንዳትረሳ!
 JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY')
 JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID')
 TOKEN = os.environ.get('BOT_TOKEN')
-ADMIN_ID = "8519835529" # ያንተ ID
+ADMIN_ID = "8519835529" 
 
 # --- DATABASE ENGINE (JSONBIN) ---
 def get_db():
-    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID: return {}
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID: 
+        print("❌ JSONBin Env Vars Missing")
+        return {}
     try:
         url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
         headers = {"X-Master-Key": JSONBIN_API_KEY}
         res = requests.get(url, headers=headers)
         if res.status_code == 200:
             return res.json().get("record", {})
+        print(f"❌ DB Read Error: {res.text}")
         return {}
-    except: return {}
+    except Exception as e:
+        print(f"❌ Connection Error: {e}")
+        return {}
 
 def save_db(data):
     if not JSONBIN_API_KEY or not JSONBIN_BIN_ID: return
@@ -36,121 +41,150 @@ def save_db(data):
             "Content-Type": "application/json"
         }
         requests.put(url, headers=headers, json=data)
-    except: pass
+    except Exception as e:
+        print(f"❌ Save Error: {e}")
 
 # --- ROUTES ---
 
 @app.route('/')
 def home():
-    return "RiyalNet JSONBin Backend Live 🚀", 200
+    # Debug info to check if Env vars are loaded
+    env_status = {
+        "JSONBIN_KEY": "Loaded" if JSONBIN_API_KEY else "Missing",
+        "JSONBIN_ID": "Loaded" if JSONBIN_BIN_ID else "Missing",
+        "BOT_TOKEN": "Loaded" if TOKEN else "Missing"
+    }
+    return jsonify({"status": "RiyalNet Backend Live 🚀", "env_check": env_status})
 
 # 1. USER HANDLER
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
 def handle_user(user_id):
-    db = get_db()
-    users = db.get("users", {})
-    user = users.get(user_id)
+    try:
+        db = get_db()
+        users = db.get("users", {})
+        user = users.get(user_id)
 
-    # Global Settings Check (Maintenance)
-    settings = db.get("settings", {})
-    if settings.get("maintenance", False) and user_id != ADMIN_ID:
-        return jsonify({"error": "MAINTENANCE"}), 503
+        # Global Settings Check
+        settings = db.get("settings", {})
+        if settings.get("maintenance", False) and str(user_id) != ADMIN_ID:
+            return jsonify({"error": "MAINTENANCE"}), 503
 
-    # Ban Check
-    if user and user.get("banned", False):
-        return jsonify({"error": "BANNED"}), 403
+        # Ban Check
+        if user and user.get("banned", False):
+            return jsonify({"error": "BANNED"}), 403
 
-    if request.method == 'POST':
-        data = request.json
-        if not user: 
-            user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
+        if request.method == 'POST':
+            data = request.json
+            if not user: 
+                user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
+            
+            # Update Info
+            user['first_name'] = data.get('first_name', user.get('first_name'))
+            user['photo_url'] = data.get('photo_url', user.get('photo_url'))
+            
+            users[user_id] = user
+            db["users"] = users
+            save_db(db)
+            return jsonify(user)
         
-        # Update Info
-        user['first_name'] = data.get('first_name', user.get('first_name'))
-        user['photo_url'] = data.get('photo_url', user.get('photo_url'))
-        
-        users[user_id] = user
-        db["users"] = users
-        save_db(db)
+        if not user:
+            # Auto-create
+            user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0, "banned": False}
+            users[user_id] = user
+            db["users"] = users
+            save_db(db)
+            
         return jsonify(user)
-    
-    if not user:
-        # Auto-create
-        user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0, "banned": False}
-        users[user_id] = user
-        db["users"] = users
-        save_db(db)
-        
-    return jsonify(user)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # 2. ADD BALANCE
 @app.route('/api/add_balance', methods=['POST'])
 def add_balance():
-    data = request.json
-    uid = str(data.get('user_id'))
-    amount = float(data.get('amount'))
-    
-    db = get_db()
-    users = db.get("users", {})
-    user = users.get(uid)
-    
-    if not user: return jsonify({"error": "User not found"}), 404
-    
-    user['balance'] = round(user.get('balance', 0) + amount, 2)
-    
-    if amount == 0.50:
-        user['today_ads'] = user.get('today_ads', 0) + 1
-        user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
+    try:
+        data = request.json
+        uid = str(data.get('user_id'))
+        amount = float(data.get('amount'))
         
-    users[uid] = user
-    db["users"] = users
-    save_db(db)
-    
-    return jsonify({"status": "success", "new_balance": user['balance']})
+        db = get_db()
+        users = db.get("users", {})
+        user = users.get(uid)
+        
+        if not user: return jsonify({"error": "User not found"}), 404
+        
+        user['balance'] = round(user.get('balance', 0) + amount, 2)
+        
+        if amount == 0.50:
+            user['today_ads'] = user.get('today_ads', 0) + 1
+            user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
+            
+        users[uid] = user
+        db["users"] = users
+        save_db(db)
+        
+        return jsonify({"status": "success", "new_balance": user['balance']})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# 3. ADMIN ACTIONS (Tasks, Ban, Maintenance)
+# 3. ADMIN ACTIONS
 @app.route('/api/admin/action', methods=['POST'])
 def admin_action():
-    req = request.json
-    if str(req.get('admin_id')) != ADMIN_ID:
-        return jsonify({"error": "Unauthorized"}), 403
+    try:
+        req = request.json
+        if str(req.get('admin_id')) != ADMIN_ID:
+            return jsonify({"error": "Unauthorized"}), 403
+            
+        action = req.get('action')
+        db = get_db()
         
-    action = req.get('action')
-    db = get_db()
-    
-    if action == "add_task":
-        tasks = db.get("global_tasks", [])
-        new_task = req.get('task')
-        new_task['id'] = int(time.time())
-        tasks.append(new_task)
-        db["global_tasks"] = tasks
-        save_db(db)
-        return jsonify({"status": "Task Added"})
+        if action == "add_task":
+            tasks = db.get("global_tasks", [])
+            new_task = req.get('task')
+            new_task['id'] = int(time.time())
+            tasks.append(new_task)
+            db["global_tasks"] = tasks
+            save_db(db)
+            return jsonify({"status": "Task Added"})
 
-    elif action == "delete_task":
-        tid = req.get('task_id')
-        tasks = db.get("global_tasks", [])
-        db["global_tasks"] = [t for t in tasks if t.get('id') != tid]
-        save_db(db)
-        return jsonify({"status": "Task Deleted"})
+        elif action == "delete_task":
+            tid = req.get('task_id')
+            tasks = db.get("global_tasks", [])
+            db["global_tasks"] = [t for t in tasks if t.get('id') != tid]
+            save_db(db)
+            return jsonify({"status": "Task Deleted"})
 
-    elif action == "ban_user":
-        target = req.get('target_id')
-        status = req.get('status') # True/False
-        users = db.get("users", {})
-        if target in users:
-            users[target]['banned'] = status
-            db["users"] = users
+        elif action == "ban_user":
+            target = req.get('target_id')
+            status = req.get('status')
+            users = db.get("users", {})
+            if target in users:
+                users[target]['banned'] = status
+                db["users"] = users
+                save_db(db)
+                return jsonify({"status": "Updated"})
+                
+        elif action == "maintenance":
+            status = req.get('status')
+            db["settings"] = {"maintenance": status}
             save_db(db)
             return jsonify({"status": "Updated"})
-            
-    elif action == "maintenance":
-        status = req.get('status')
-        db["settings"] = {"maintenance": status}
-        save_db(db)
-        return jsonify({"status": "Updated"})
 
-    return jsonify({"error": "Invalid Action"})
+        elif action == "send_money":
+            target_id = req.get('target_id')
+            amount = float(req.get('amount'))
+            users = db.get("users", {})
+            target = users.get(target_id)
+            if target:
+                target['balance'] = round(target.get('balance', 0) + amount, 2)
+                users[target_id] = target
+                db["users"] = users
+                save_db(db)
+                return jsonify({"status": "Money Sent"})
+            return jsonify({"error": "User not found"})
+
+        return jsonify({"error": "Invalid Action"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # 4. GET TASKS
 @app.route('/api/tasks', methods=['GET'])
@@ -161,34 +195,39 @@ def get_tasks():
 # 5. WITHDRAWALS
 @app.route('/api/withdraw', methods=['POST'])
 def withdraw():
-    data = request.json
-    uid = str(data.get('user_id'))
-    amount = float(data.get('amount'))
-    
-    db = get_db()
-    users = db.get("users", {})
-    user = users.get(uid)
-    
-    if not user or user.get('balance', 0) < amount:
-        return jsonify({"error": "Insufficient funds"}), 400
+    try:
+        req_data = request.json
+        uid = str(req_data.get('user_id'))
+        amount = float(req_data.get('amount'))
         
-    user['balance'] = round(user['balance'] - amount, 2)
-    users[uid] = user
-    
-    w_list = db.get("withdrawals", [])
-    data['status'] = "Pending"
-    w_list.insert(0, data)
-    db["withdrawals"] = w_list
-    db["users"] = users
-    save_db(db)
-    
-    return jsonify({"status": "success"})
+        db = get_db()
+        users = db.get("users", {})
+        user = users.get(uid)
+        
+        if not user or user.get('balance', 0) < amount:
+            return jsonify({"error": "Insufficient funds"}), 400
+        
+        user['balance'] = round(user['balance'] - amount, 2)
+        users[uid] = user
+        
+        reqs = db.get("withdrawals", [])
+        req_data['status'] = "Pending"
+        req_data['date'] = str(time.time())
+        reqs.insert(0, req_data)
+        db["withdrawals"] = reqs
+        db["users"] = users
+        save_db(db)
+        
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# For Vercel
-if __name__ == '__main__':
-    app.run()
+@app.route('/api/admin/withdrawals', methods=['GET'])
+def get_withdrawals():
+    db = get_db()
+    return jsonify(db.get("withdrawals", []))
 
-# --- WEBHOOK (Start Command Fix) ---
+# --- 🔥 WEBHOOK (MOVED UP) 🔥 ---
 @app.route('/api/webhook', methods=['POST'])
 def webhook():
     if not TOKEN: return "No Token", 200
@@ -199,20 +238,17 @@ def webhook():
     msg = data["message"]
     chat_id = msg["chat"]["id"]
     
-    # Check for text message
     if "text" in msg:
         text = msg["text"]
         
-        # Only respond to /start
         if text.startswith("/start"):
             uid = str(msg["from"]["id"])
             first_name = msg["from"].get("first_name", "User")
             
-            # Save User on Start (Correct Structure)
+            # Save User
             all_data = get_db()
             users = all_data.get("users", {})
             
-            # ሰውየው ከሌለ እንመዝግበው
             if uid not in users:
                 users[uid] = {
                     "user_id": uid, 
@@ -225,7 +261,7 @@ def webhook():
                 all_data["users"] = users
                 save_db(all_data)
             
-            # Reply Message
+            # Reply
             payload = {
                 "chat_id": chat_id,
                 "text": f"👋 Welcome {first_name}!\n\nTap below to start earning:",
@@ -241,3 +277,7 @@ def webhook():
                 print(f"Telegram API Error: {e}")
 
     return "OK"
+
+# For Vercel - MUST BE AT THE BOTTOM
+if __name__ == '__main__':
+    app.run()
