@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import os
 import requests
 import json
@@ -15,7 +17,7 @@ KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 FRONTEND_URL = "https://net-ui-iota.vercel.app"
 ADMIN_ID = "8519835529"
 
-# --- 🔥 FIXED DB ENGINE (THE FINAL FIX) 🔥 ---
+# --- 🔥 FIXED DB ENGINE (PIPELINE FIX) 🔥 ---
 def kv_execute(command, key=None, value=None):
     if not KV_URL or not KV_TOKEN:
         print("❌ KV ENV MISSING")
@@ -26,36 +28,43 @@ def kv_execute(command, key=None, value=None):
         if key is not None:
             cmd.append(key)
         if value is not None:
-            # Redis stores strings, so we dump JSON
-            cmd.append(json.dumps(value))
+            # Redis stores strings, so we ensure it's a string
+            if isinstance(value, (dict, list)):
+                cmd.append(json.dumps(value))
+            else:
+                cmd.append(str(value))
 
-        # 🔥 THE FIX IS HERE: json={"commands": [cmd]} (Object, not Array)
+        # 🔥 FIX 1: Send Raw List (not dict)
         response = requests.post(
             f"{KV_URL}/pipeline",
-            headers={
-                "Authorization": f"Bearer {KV_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            json={"commands": [cmd]}, 
+            headers={"Authorization": f"Bearer {KV_TOKEN}"},
+            json=[cmd], 
             timeout=10
         )
         
         data = response.json()
         
-        # Check if result exists
-        if "result" not in data or not data["result"]:
-            return None
+        # 🔥 FIX 2: Handle List Response Correctly
+        # Upstash returns: [{"result": "OK"}] or [{"result": "JSON_STRING"}]
+        if isinstance(data, list) and len(data) > 0:
+            item = data[0]
+            if "error" in item:
+                print(f"❌ Redis Command Error: {item['error']}")
+                return None
             
-        result = data["result"][0].get("result")
-        
-        # If GET, parse the string back to JSON
-        if command == "GET" and result:
-            return json.loads(result)
+            result = item.get("result")
             
-        return result
+            # If getting data, parse JSON string back to Dict
+            if command == "GET" and result and isinstance(result, str):
+                try:
+                    return json.loads(result)
+                except:
+                    return result # Return as is if not JSON
+            
+            return result
 
     except Exception as e:
-        print("❌ KV ERROR:", e)
+        print(f"❌ KV CONNECTION ERROR: {e}")
         return None
 
 # Wrappers
@@ -66,19 +75,8 @@ def db_set(key, value): return kv_execute("SET", key, value)
 
 @app.route('/')
 def home():
-    return "RiyalNet Backend Live 🚀", 200
-
-# 🧪 TEST ENDPOINT (Use this to confirm DB works!)
-@app.route('/api/debug_kv')
-def debug_kv():
-    test_data = {"status": "OK", "timestamp": time.time()}
-    set_res = db_set("debug:test", test_data)
-    get_res = db_get("debug:test")
-    return jsonify({
-        "set_result": set_res, 
-        "get_result": get_res,
-        "message": "If get_result has data, DB IS FIXED! ✅"
-    })
+    # Simple check
+    return "RiyalNet Backend Live (DB Fixed) 🚀", 200
 
 # 1. USER
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
@@ -90,11 +88,15 @@ def handle_user(user_id):
         if not user: 
             user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
         
-        user.update(data)
+        # Update fields
+        user['first_name'] = data.get('first_name', user.get('first_name'))
+        user['photo_url'] = data.get('photo_url', user.get('photo_url'))
+        
         db_set(f"user:{user_id}", user)
         return jsonify(user)
     
     if not user:
+        # Auto-create
         user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0}
         db_set(f"user:{user_id}", user)
         
@@ -115,7 +117,8 @@ def add_balance():
     
     if amount == 0.50:
         user['today_ads'] = user.get('today_ads', 0) + 1
-        
+        user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
+    
     db_set(f"user:{uid}", user)
     return jsonify({"status": "success", "new_balance": user['balance']})
 
@@ -165,7 +168,7 @@ def withdraw():
     if not user or user['balance'] < amount:
         return jsonify({"error": "Insufficient funds"}), 400
     
-    user['balance'] -= amount
+    user['balance'] = round(user['balance'] - amount, 2)
     db_set(f"user:{uid}", user)
     
     reqs = db_get("withdrawals") or []
@@ -179,7 +182,7 @@ def withdraw():
 def get_withdrawals():
     return jsonify(db_get("withdrawals") or [])
 
-# --- WEBHOOK (RAW REQUESTS) ---
+# --- WEBHOOK ---
 @app.route('/api/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(silent=True)
@@ -190,7 +193,7 @@ def webhook():
     uid = str(msg["from"]["id"])
     first_name = msg["from"].get("first_name", "User")
     
-    # Save User
+    # Save User on Start
     if not db_get(f"user:{uid}"):
         db_set(f"user:{uid}", {"user_id": uid, "first_name": first_name, "balance": 0.00})
     
