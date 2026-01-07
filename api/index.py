@@ -17,7 +17,7 @@ KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 FRONTEND_URL = "https://net-ui-iota.vercel.app"
 ADMIN_ID = "8519835529"
 
-# --- 🔥 FIXED DB ENGINE (FASTER TIMEOUT) 🔥 ---
+# --- 🔥 FIXED DB ENGINE (STRICT PIPELINE) 🔥 ---
 def kv_execute(command, key=None, value=None):
     if not KV_URL or not KV_TOKEN:
         print("❌ KV ENV MISSING")
@@ -34,20 +34,25 @@ def kv_execute(command, key=None, value=None):
             else:
                 cmd.append(str(value))
 
-        # 🔥 Timeout reduced to 4s (Faster than Frontend's 8s limit)
+        # 🔥 FIX: Use Correct Pipeline Object Format {"commands": [...]}
+        # ይህ ቅርጽ ፈጣን እና አስተማማኝ ነው
         response = requests.post(
             f"{KV_URL}/pipeline",
             headers={"Authorization": f"Bearer {KV_TOKEN}"},
-            json=[cmd], 
-            timeout=4 
+            json={"commands": [cmd]}, 
+            timeout=5 # Short timeout to prevent frontend hanging
         )
         
         data = response.json()
         
-        if isinstance(data, list) and len(data) > 0:
-            item = data[0]
+        # 🔥 FIX: Parse the Object Response Correctly
+        # Format: { "result": [ { "result": "..." } ] }
+        if "result" in data and len(data["result"]) > 0:
+            item = data["result"][0]
+            
+            # Check inner error
             if "error" in item:
-                print(f"❌ Redis Command Error: {item['error']}")
+                print(f"❌ Redis Inner Error: {item['error']}")
                 return None
             
             result = item.get("result")
@@ -75,11 +80,11 @@ def home():
     # 🔥 DB TEST ON HOME PAGE 🔥
     try:
         start_t = time.time()
-        pong = kv_execute("PING")
-        duration = time.time() - start_t
-        status = f"✅ Connected (Latency: {duration:.2f}s)" if pong == "PONG" else "❌ Error"
-    except:
-        status = "❌ Connection Failed"
+        # Simple string set/get test
+        db_set("ping", "pong")
+        status = "✅ Connected" if db_get("ping") == "pong" else "⚠️ Sync Error"
+    except Exception as e:
+        status = f"❌ Error: {str(e)}"
         
     return f"RiyalNet Backend Live. DB Status: {status}", 200
 
