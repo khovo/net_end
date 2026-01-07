@@ -23,7 +23,6 @@ def get_db():
         headers = {"X-Master-Key": JSONBIN_API_KEY}
         res = requests.get(url, headers=headers)
         if res.status_code == 200:
-            # 🔥 FIX: .get("record") መረጃውን ከውስጥ ለማውጣት ወሳኝ ነው
             return res.json().get("record", {})
         return {}
     except: return {}
@@ -188,3 +187,57 @@ def withdraw():
 # For Vercel
 if __name__ == '__main__':
     app.run()
+
+# --- WEBHOOK (Start Command Fix) ---
+@app.route('/api/webhook', methods=['POST'])
+def webhook():
+    if not TOKEN: return "No Token", 200
+
+    data = request.get_json(silent=True)
+    if not data or "message" not in data: return "OK"
+    
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    
+    # Check for text message
+    if "text" in msg:
+        text = msg["text"]
+        
+        # Only respond to /start
+        if text.startswith("/start"):
+            uid = str(msg["from"]["id"])
+            first_name = msg["from"].get("first_name", "User")
+            
+            # Save User on Start (Correct Structure)
+            all_data = get_db()
+            users = all_data.get("users", {})
+            
+            # ሰውየው ከሌለ እንመዝግበው
+            if uid not in users:
+                users[uid] = {
+                    "user_id": uid, 
+                    "first_name": first_name, 
+                    "balance": 0.00,
+                    "today_ads": 0,
+                    "total_ref": 0,
+                    "ads_watched_total": 0
+                }
+                all_data["users"] = users
+                save_db(all_data)
+            
+            # Reply Message
+            payload = {
+                "chat_id": chat_id,
+                "text": f"👋 Welcome {first_name}!\n\nTap below to start earning:",
+                "reply_markup": {
+                    "inline_keyboard": [[
+                        {"text": "🚀 Open App", "web_app": {"url": "https://net-ui-iota.vercel.app"}}
+                    ]]
+                }
+            }
+            try:
+                requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=payload)
+            except Exception as e:
+                print(f"Telegram API Error: {e}")
+
+    return "OK"
