@@ -17,7 +17,7 @@ KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
 FRONTEND_URL = "https://net-ui-iota.vercel.app"
 ADMIN_ID = "8519835529"
 
-# --- 🔥 FIXED DB ENGINE (PIPELINE FIX) 🔥 ---
+# --- 🔥 FIXED DB ENGINE (FASTER TIMEOUT) 🔥 ---
 def kv_execute(command, key=None, value=None):
     if not KV_URL or not KV_TOKEN:
         print("❌ KV ENV MISSING")
@@ -34,18 +34,16 @@ def kv_execute(command, key=None, value=None):
             else:
                 cmd.append(str(value))
 
-        # 🔥 FIX 1: Send Raw List (not dict)
+        # 🔥 Timeout reduced to 4s (Faster than Frontend's 8s limit)
         response = requests.post(
             f"{KV_URL}/pipeline",
             headers={"Authorization": f"Bearer {KV_TOKEN}"},
             json=[cmd], 
-            timeout=10
+            timeout=4 
         )
         
         data = response.json()
         
-        # 🔥 FIX 2: Handle List Response Correctly
-        # Upstash returns: [{"result": "OK"}] or [{"result": "JSON_STRING"}]
         if isinstance(data, list) and len(data) > 0:
             item = data[0]
             if "error" in item:
@@ -54,12 +52,11 @@ def kv_execute(command, key=None, value=None):
             
             result = item.get("result")
             
-            # If getting data, parse JSON string back to Dict
             if command == "GET" and result and isinstance(result, str):
                 try:
                     return json.loads(result)
                 except:
-                    return result # Return as is if not JSON
+                    return result
             
             return result
 
@@ -75,8 +72,16 @@ def db_set(key, value): return kv_execute("SET", key, value)
 
 @app.route('/')
 def home():
-    # Simple check
-    return "RiyalNet Backend Live (DB Fixed) 🚀", 200
+    # 🔥 DB TEST ON HOME PAGE 🔥
+    try:
+        start_t = time.time()
+        pong = kv_execute("PING")
+        duration = time.time() - start_t
+        status = f"✅ Connected (Latency: {duration:.2f}s)" if pong == "PONG" else "❌ Error"
+    except:
+        status = "❌ Connection Failed"
+        
+    return f"RiyalNet Backend Live. DB Status: {status}", 200
 
 # 1. USER
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
