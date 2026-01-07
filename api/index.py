@@ -11,115 +11,101 @@ app = Flask(__name__)
 CORS(app)
 
 # --- CONFIG ---
-TOKEN = os.environ.get('BOT_TOKEN')
-KV_URL = os.environ.get('KV_REST_API_URL')
-KV_TOKEN = os.environ.get('KV_REST_API_TOKEN')
+TOKEN = os.environ.get('BOT_TOKEN') # ቦት ቶከን ብቻ Vercel ላይ ይሁን
+
+# 🔥 ያንተ JSONBIN ቁልፎች (Directly Inserted) 🔥
+JSONBIN_BIN_ID = "695e0dbad0ea881f405a2247"
+JSONBIN_API_KEY = "$2a$10$chn2of2sWeJyBzVyeL8rm.bTpgkDtagCcSiTrjDRnSB.hSNhkKCYC"
+
 FRONTEND_URL = "https://net-ui-iota.vercel.app"
 ADMIN_ID = "8519835529"
 
-# --- 🔥 FIXED DB ENGINE (STRICT PIPELINE) 🔥 ---
-def kv_execute(command, key=None, value=None):
-    if not KV_URL or not KV_TOKEN:
-        print("❌ KV ENV MISSING")
-        return None
-    
+# --- 🔥 JSONBIN DATABASE ENGINE 🔥 ---
+
+def get_all_data():
+    """ሙሉ ዳታቤዙን ያመጣል"""
     try:
-        cmd = [command]
-        if key is not None:
-            cmd.append(key)
-        if value is not None:
-            # Redis stores strings, so we ensure it's a string
-            if isinstance(value, (dict, list)):
-                cmd.append(json.dumps(value))
-            else:
-                cmd.append(str(value))
-
-        # 🔥 FIX: Use Correct Pipeline Object Format {"commands": [...]}
-        # ይህ ቅርጽ ፈጣን እና አስተማማኝ ነው
-        response = requests.post(
-            f"{KV_URL}/pipeline",
-            headers={"Authorization": f"Bearer {KV_TOKEN}"},
-            json={"commands": [cmd]}, 
-            timeout=5 # Short timeout to prevent frontend hanging
-        )
+        url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
+        headers = {"X-Master-Key": JSONBIN_API_KEY}
+        response = requests.get(url, headers=headers)
         
-        data = response.json()
-        
-        # 🔥 FIX: Parse the Object Response Correctly
-        # Format: { "result": [ { "result": "..." } ] }
-        if "result" in data and len(data["result"]) > 0:
-            item = data["result"][0]
+        if response.status_code == 200:
+            return response.json().get("record", {})
+        else:
+            print(f"❌ Read Error: {response.text}")
+            return {}
             
-            # Check inner error
-            if "error" in item:
-                print(f"❌ Redis Inner Error: {item['error']}")
-                return None
-            
-            result = item.get("result")
-            
-            if command == "GET" and result and isinstance(result, str):
-                try:
-                    return json.loads(result)
-                except:
-                    return result
-            
-            return result
-
     except Exception as e:
-        print(f"❌ KV CONNECTION ERROR: {e}")
-        return None
+        print(f"❌ Connection Error: {e}")
+        return {}
 
-# Wrappers
-def db_get(key): return kv_execute("GET", key)
-def db_set(key, value): return kv_execute("SET", key, value)
+def save_all_data(data):
+    """ሙሉ ዳታቤዙን ይጽፋል"""
+    try:
+        url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+        headers = {
+            "X-Master-Key": JSONBIN_API_KEY,
+            "Content-Type": "application/json"
+        }
+        # JSONBin ባዶ ዳታ አይቀበልም
+        if not data: data = {"status": "reset", "users": {}}
+        
+        requests.put(url, headers=headers, json=data)
+    except Exception as e:
+        print(f"❌ Save Error: {e}")
 
 # --- ROUTES ---
 
 @app.route('/')
 def home():
-    # 🔥 DB TEST ON HOME PAGE 🔥
-    try:
-        start_t = time.time()
-        # Simple string set/get test
-        db_set("ping", "pong")
-        status = "✅ Connected" if db_get("ping") == "pong" else "⚠️ Sync Error"
-    except Exception as e:
-        status = f"❌ Error: {str(e)}"
-        
-    return f"RiyalNet Backend Live. DB Status: {status}", 200
+    # Simple check
+    db_data = get_all_data()
+    status = "Connected ✅" if db_data else "Error connecting to JSONBin ❌"
+    return f"RiyalNet Backend with JSONBin. DB Status: {status}", 200
 
 # 1. USER
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
 def handle_user(user_id):
-    user = db_get(f"user:{user_id}")
+    all_data = get_all_data()
+    # ተጠቃሚው "users" በሚለው ቁልፍ ውስጥ ይፈልጋል
+    users = all_data.get("users", {})
+    user = users.get(user_id)
     
     if request.method == 'POST':
-        data = request.json
+        req_data = request.json
         if not user: 
             user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
         
         # Update fields
-        user['first_name'] = data.get('first_name', user.get('first_name'))
-        user['photo_url'] = data.get('photo_url', user.get('photo_url'))
+        user['first_name'] = req_data.get('first_name', user.get('first_name'))
+        user['photo_url'] = req_data.get('photo_url', user.get('photo_url'))
         
-        db_set(f"user:{user_id}", user)
+        # Save back
+        users[user_id] = user
+        all_data["users"] = users
+        save_all_data(all_data)
         return jsonify(user)
     
     if not user:
         # Auto-create
         user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0}
-        db_set(f"user:{user_id}", user)
+        users[user_id] = user
+        all_data["users"] = users
+        save_all_data(all_data)
         
     return jsonify(user)
 
 # 2. ADD BALANCE
 @app.route('/api/add_balance', methods=['POST'])
 def add_balance():
-    data = request.json
-    uid = str(data.get('user_id'))
-    amount = float(data.get('amount'))
+    req_data = request.json
+    uid = str(req_data.get('user_id'))
+    amount = float(req_data.get('amount'))
     
-    user = db_get(f"user:{uid}")
+    all_data = get_all_data()
+    users = all_data.get("users", {})
+    user = users.get(uid)
+    
     if not user:
         user = {"user_id": uid, "first_name": "User", "balance": 0.00}
     
@@ -129,35 +115,44 @@ def add_balance():
         user['today_ads'] = user.get('today_ads', 0) + 1
         user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
     
-    db_set(f"user:{uid}", user)
+    users[uid] = user
+    all_data["users"] = users
+    save_all_data(all_data)
+    
     return jsonify({"status": "success", "new_balance": user['balance']})
 
 # 3. ADMIN ACTION
 @app.route('/api/admin/action', methods=['POST'])
 def admin_action():
-    data = request.json
-    admin_uid = str(data.get('admin_id'))
+    req_data = request.json
+    admin_uid = str(req_data.get('admin_id'))
     
     if admin_uid != ADMIN_ID:
         return jsonify({"error": "Unauthorized"}), 403
         
-    action = data.get('action')
+    action = req_data.get('action')
+    all_data = get_all_data()
     
     if action == "add_task":
-        tasks = db_get("global_tasks") or []
-        new_task = data.get('task')
+        tasks = all_data.get("global_tasks", [])
+        new_task = req_data.get('task')
         new_task['id'] = int(time.time())
         tasks.append(new_task)
-        db_set("global_tasks", tasks)
+        all_data["global_tasks"] = tasks
+        save_all_data(all_data)
         return jsonify({"status": "Task Added"})
         
     elif action == "send_money":
-        target_id = data.get('target_id')
-        amount = float(data.get('amount'))
-        target = db_get(f"user:{target_id}")
+        target_id = req_data.get('target_id')
+        amount = float(req_data.get('amount'))
+        users = all_data.get("users", {})
+        target = users.get(target_id)
+        
         if target:
-            target['balance'] += amount
-            db_set(f"user:{target_id}", target)
+            target['balance'] = round(target.get('balance', 0) + amount, 2)
+            users[target_id] = target
+            all_data["users"] = users
+            save_all_data(all_data)
             return jsonify({"status": "Money Sent"})
         return jsonify({"error": "Target not found"})
         
@@ -166,31 +161,40 @@ def admin_action():
 # 4. TASKS & WITHDRAWALS
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
-    return jsonify(db_get("global_tasks") or [])
+    data = get_all_data()
+    return jsonify(data.get("global_tasks", []))
 
 @app.route('/api/withdraw', methods=['POST'])
 def withdraw():
-    data = request.json
-    uid = str(data.get('user_id'))
-    amount = float(data.get('amount'))
+    req_data = request.json
+    uid = str(req_data.get('user_id'))
+    amount = float(req_data.get('amount'))
     
-    user = db_get(f"user:{uid}")
-    if not user or user['balance'] < amount:
+    all_data = get_all_data()
+    users = all_data.get("users", {})
+    user = users.get(uid)
+    
+    if not user or user.get('balance', 0) < amount:
         return jsonify({"error": "Insufficient funds"}), 400
     
     user['balance'] = round(user['balance'] - amount, 2)
-    db_set(f"user:{uid}", user)
+    users[uid] = user
+    all_data["users"] = users
     
-    reqs = db_get("withdrawals") or []
-    data['status'] = "Pending"
-    reqs.insert(0, data)
-    db_set("withdrawals", reqs)
+    reqs = all_data.get("withdrawals", [])
+    req_data['status'] = "Pending"
+    req_data['date'] = str(time.time())
+    reqs.insert(0, req_data)
+    all_data["withdrawals"] = reqs
+    
+    save_all_data(all_data)
     
     return jsonify({"status": "success"})
 
 @app.route('/api/admin/withdrawals', methods=['GET'])
 def get_withdrawals():
-    return jsonify(db_get("withdrawals") or [])
+    data = get_all_data()
+    return jsonify(data.get("withdrawals", []))
 
 # --- WEBHOOK ---
 @app.route('/api/webhook', methods=['POST'])
@@ -204,8 +208,13 @@ def webhook():
     first_name = msg["from"].get("first_name", "User")
     
     # Save User on Start
-    if not db_get(f"user:{uid}"):
-        db_set(f"user:{uid}", {"user_id": uid, "first_name": first_name, "balance": 0.00})
+    all_data = get_all_data()
+    users = all_data.get("users", {})
+    
+    if uid not in users:
+        users[uid] = {"user_id": uid, "first_name": first_name, "balance": 0.00}
+        all_data["users"] = users
+        save_all_data(all_data)
     
     # Reply
     payload = {
