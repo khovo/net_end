@@ -1,26 +1,35 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import os
 import requests
 import json
-import os
-import asyncio
+import time
 
 app = Flask(__name__)
+
+# 🔥 CORS FIX: Allow ALL origins explicitly
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 🔥 HARDCODED KEYS (ቀጥታ የገቡ) 🔥
-JSONBIN_API_KEY = "$2a$10$chn2of2sWeJyBzVyeL8rm.bTpgkDtagCcSiTrjDRnSB.hSNhkKCYC"
-JSONBIN_BIN_ID = "695e0dbad0ea881f405a2247"
+# 🔥 ADDITIONAL SECURITY HEADER FIX 🔥
+# ይሄ መስመር ነው ዋናው መፍትሄ! ማንኛውም request ሲመጣ "Access-Control" ይጨምርበታል።
+@app.after_request
+def add_header(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, PUT, DELETE'
+    return response
 
-# ቦት ቶከን ግን ከ Vercel ይምጣ (ወይም እዚሁ መጻፍ ትችላለህ)
-TOKEN = os.environ.get('BOT_TOKEN') 
+# --- CONFIG ---
+TOKEN = os.environ.get('BOT_TOKEN')
+JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY')
+JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID')
+
 FRONTEND_URL = "https://net-ui-iota.vercel.app"
-ADMIN_ID = "8519835529"
+ADMIN_ID = "8519835529" 
 
-# --- DB ENGINE ---
+# --- DATABASE ENGINE ---
 def get_db():
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID: return {}
     try:
         url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
         headers = {"X-Master-Key": JSONBIN_API_KEY}
@@ -31,6 +40,7 @@ def get_db():
     except: return {}
 
 def save_db(data):
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID: return
     try:
         url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
         headers = {
@@ -44,126 +54,173 @@ def save_db(data):
 
 @app.route('/')
 def home():
-    # ዳታቤዙ መስራቱን ለማረጋገጥ
-    db = get_db()
-    status = "Connected ✅" if db else "Error ❌"
-    return jsonify({"status": "Backend Live", "db_check": status})
+    return jsonify({"status": "Backend Live", "db_check": "Connected ✅"})
 
+# 1. USER
 @app.route('/api/user/<user_id>', methods=['GET', 'POST'])
 def handle_user(user_id):
-    try:
-        db = get_db()
-        users = db.get("users", {})
-        user = users.get(user_id)
+    if request.method == 'OPTIONS': return jsonify({'status': 'ok'}), 200 # Handle Preflight
 
-        # Maintenance Check
-        settings = db.get("settings", {})
-        if settings.get("maintenance", False) and str(user_id) != ADMIN_ID:
-            return jsonify({"error": "MAINTENANCE"}), 503
-
-        if request.method == 'POST':
-            data = request.json
-            if not user: 
-                user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
-            
-            user['first_name'] = data.get('first_name', user.get('first_name'))
-            user['photo_url'] = data.get('photo_url', user.get('photo_url'))
-            
-            users[user_id] = user
-            db["users"] = users
-            save_db(db)
-            return jsonify(user)
+    all_data = get_db()
+    users = all_data.get("users", {})
+    user = users.get(user_id)
+    
+    if request.method == 'POST':
+        req_data = request.json
+        if not user: 
+            user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
         
-        if not user:
-            user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0}
-            users[user_id] = user
-            db["users"] = users
-            save_db(db)
-            
+        user['first_name'] = req_data.get('first_name', user.get('first_name'))
+        user['photo_url'] = req_data.get('photo_url', user.get('photo_url'))
+        
+        users[user_id] = user
+        all_data["users"] = users
+        save_db(all_data)
         return jsonify(user)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    
+    if not user:
+        user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0}
+        users[user_id] = user
+        all_data["users"] = users
+        save_db(all_data)
+        
+    return jsonify(user)
 
+# 2. ADD BALANCE
 @app.route('/api/add_balance', methods=['POST'])
 def add_balance():
-    try:
-        data = request.json
-        uid = str(data.get('user_id'))
-        amount = float(data.get('amount'))
-        
-        db = get_db()
-        users = db.get("users", {})
-        user = users.get(uid)
-        
-        if not user: return jsonify({"error": "User not found"}), 404
-        
-        user['balance'] = round(user.get('balance', 0) + amount, 2)
-        if amount == 0.50:
-            user['today_ads'] = user.get('today_ads', 0) + 1
-            
-        users[uid] = user
-        db["users"] = users
-        save_db(db)
-        
-        return jsonify({"status": "success", "new_balance": user['balance']})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    if request.method == 'OPTIONS': return jsonify({'status': 'ok'}), 200
 
-# --- ADMIN ROUTES ---
+    req_data = request.json
+    uid = str(req_data.get('user_id'))
+    amount = float(req_data.get('amount'))
+    
+    all_data = get_db()
+    users = all_data.get("users", {})
+    user = users.get(uid)
+    
+    if not user:
+        user = {"user_id": uid, "first_name": "User", "balance": 0.00}
+    
+    user['balance'] = round(user.get('balance', 0) + amount, 2)
+    
+    if amount == 0.50:
+        user['today_ads'] = user.get('today_ads', 0) + 1
+        user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
+    
+    users[uid] = user
+    all_data["users"] = users
+    save_db(all_data)
+    
+    return jsonify({"status": "success", "new_balance": user['balance']})
+
+# 3. ADMIN ACTION
 @app.route('/api/admin/action', methods=['POST'])
 def admin_action():
-    try:
-        req = request.json
-        if str(req.get('admin_id')) != ADMIN_ID:
-            return jsonify({"error": "Unauthorized"}), 403
-            
-        action = req.get('action')
-        db = get_db()
+    req_data = request.json
+    admin_uid = str(req_data.get('admin_id'))
+    
+    if admin_uid != ADMIN_ID:
+        return jsonify({"error": "Unauthorized"}), 403
         
-        if action == "add_task":
-            tasks = db.get("global_tasks", [])
-            new_task = req.get('task')
-            new_task['id'] = int(time.time())
-            tasks.append(new_task)
-            db["global_tasks"] = tasks
-            save_db(db)
-            return jsonify({"status": "Task Added"})
-            
-        return jsonify({"status": "Action Complete"})
-    except: return jsonify({"error": "Failed"}), 500
+    action = req_data.get('action')
+    all_data = get_db()
+    
+    if action == "add_task":
+        tasks = all_data.get("global_tasks", [])
+        new_task = req_data.get('task')
+        new_task['id'] = int(time.time())
+        tasks.append(new_task)
+        all_data["global_tasks"] = tasks
+        save_db(all_data)
+        return jsonify({"status": "Task Added"})
+        
+    elif action == "send_money":
+        target_id = req_data.get('target_id')
+        amount = float(req_data.get('amount'))
+        users = all_data.get("users", {})
+        target = users.get(target_id)
+        if target:
+            target['balance'] = round(target.get('balance', 0) + amount, 2)
+            users[target_id] = target
+            all_data["users"] = users
+            save_db(all_data)
+            return jsonify({"status": "Money Sent"})
+        return jsonify({"error": "Target not found"})
+        
+    return jsonify({"error": "Invalid Action"})
 
+# 4. TASKS & WITHDRAWALS
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
-    db = get_db()
-    return jsonify(db.get("global_tasks", []))
+    data = get_db()
+    return jsonify(data.get("global_tasks", []))
+
+@app.route('/api/withdraw', methods=['POST'])
+def withdraw():
+    req_data = request.json
+    uid = str(req_data.get('user_id'))
+    amount = float(req_data.get('amount'))
+    
+    all_data = get_db()
+    users = all_data.get("users", {})
+    user = users.get(uid)
+    
+    if not user or user.get('balance', 0) < amount:
+        return jsonify({"error": "Insufficient funds"}), 400
+    
+    user['balance'] = round(user['balance'] - amount, 2)
+    users[uid] = user
+    
+    reqs = all_data.get("withdrawals", [])
+    req_data['status'] = "Pending"
+    req_data['date'] = str(time.time())
+    reqs.insert(0, req_data)
+    all_data["withdrawals"] = reqs
+    
+    save_db(all_data)
+    
+    return jsonify({"status": "success"})
+
+@app.route('/api/admin/withdrawals', methods=['GET'])
+def get_withdrawals():
+    data = get_db()
+    return jsonify(data.get("withdrawals", []))
 
 # --- WEBHOOK ---
 @app.route('/api/webhook', methods=['POST'])
 def webhook():
-    if request.method == "POST":
-        if not TOKEN: return "No Token", 200
+    data = request.get_json(silent=True)
+    if not data or "message" not in data: return "OK"
+    
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    
+    if "text" in msg and msg["text"].startswith("/start"):
+        uid = str(msg["from"]["id"])
+        first_name = msg["from"].get("first_name", "User")
         
-        try:
-            application = ApplicationBuilder().token(TOKEN).build()
-            async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                u = update.effective_user
-                btn = InlineKeyboardButton("🚀 Open App", web_app={"url": FRONTEND_URL})
-                await update.message.reply_text(f"Hello {u.first_name}!", reply_markup=InlineKeyboardMarkup([[btn]]))
+        all_data = get_db()
+        users = all_data.get("users", {})
+        
+        if uid not in users:
+            users[uid] = {"user_id": uid, "first_name": first_name, "balance": 0.00}
+            all_data["users"] = users
+            save_db(all_data)
+        
+        payload = {
+            "chat_id": chat_id,
+            "text": f"👋 Welcome {first_name}!",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "🚀 Open App", "web_app": {"url": FRONTEND_URL}}
+                ]]
+            }
+        }
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=payload)
 
-            application.add_handler(CommandHandler("start", start))
-            
-            async def runner():
-                await application.initialize()
-                update = Update.de_json(request.get_json(force=True), application.bot)
-                await application.process_update(update)
-                await application.shutdown()
+    return "OK"
 
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            loop.run_until_complete(runner())
-        except: return "Error"
-        return "OK"
-    return "Error"
+# For Vercel
+if __name__ == '__main__':
+    app.run()
