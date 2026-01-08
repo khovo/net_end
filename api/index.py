@@ -7,11 +7,10 @@ import time
 
 app = Flask(__name__)
 
-# 🔥 CORS FIX: Allow ALL origins explicitly
+# --- CORS & SECURITY HEADERS ---
+# Allow all origins for simplicity in this setup
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 🔥 ADDITIONAL SECURITY HEADER FIX 🔥
-# ይሄ መስመር ነው ዋናው መፍትሄ! ማንኛውም request ሲመጣ "Access-Control" ይጨምርበታል።
 @app.after_request
 def add_header(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -19,13 +18,11 @@ def add_header(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, PUT, DELETE'
     return response
 
-# --- CONFIG ---
+# --- CONFIGURATION ---
 TOKEN = os.environ.get('BOT_TOKEN')
 JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY')
 JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID')
-
-FRONTEND_URL = "https://net-ui-iota.vercel.app"
-ADMIN_ID = "8519835529" 
+ADMIN_ID = "8519835529"
 
 # --- DATABASE ENGINE ---
 def get_db():
@@ -54,43 +51,52 @@ def save_db(data):
 
 @app.route('/')
 def home():
-    return jsonify({"status": "Backend Live", "db_check": "Connected ✅"})
+    return jsonify({"status": "Backend Live", "message": "RiyalNet API Ready 🚀"})
 
-# 1. USER
-@app.route('/api/user/<user_id>', methods=['GET', 'POST'])
+# 1. USER SYNC
+@app.route('/api/user/<user_id>', methods=['POST'])
 def handle_user(user_id):
-    if request.method == 'OPTIONS': return jsonify({'status': 'ok'}), 200 # Handle Preflight
-
+    req_data = request.json
     all_data = get_db()
+    
+    # Check Maintenance Mode
+    if all_data.get("maintenance_mode", False) and user_id != ADMIN_ID:
+        return jsonify({"error": "Maintenance Mode On", "maintenance": True}), 503
+
     users = all_data.get("users", {})
     user = users.get(user_id)
     
-    if request.method == 'POST':
-        req_data = request.json
-        if not user: 
-            user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00}
-        
-        user['first_name'] = req_data.get('first_name', user.get('first_name'))
-        user['photo_url'] = req_data.get('photo_url', user.get('photo_url'))
-        
-        users[user_id] = user
-        all_data["users"] = users
-        save_db(all_data)
-        return jsonify(user)
-    
+    # Create or Update
     if not user:
-        user = {"user_id": user_id, "first_name": "Guest", "balance": 0.00, "today_ads": 0}
-        users[user_id] = user
-        all_data["users"] = users
-        save_db(all_data)
-        
-    return jsonify(user)
+        user = {
+            "user_id": user_id, 
+            "first_name": req_data.get('first_name', 'Guest'),
+            "balance": 0.00,
+            "ads_watched_total": 0,
+            "today_ads": 0,
+            "joined_at": time.time(),
+            "banned": False
+        }
+    
+    # Update latest info
+    user['first_name'] = req_data.get('first_name', user.get('first_name'))
+    user['photo_url'] = req_data.get('photo_url', user.get('photo_url'))
+    
+    # Save
+    users[user_id] = user
+    all_data["users"] = users
+    save_db(all_data)
+    
+    # Return user data + global config
+    return jsonify({
+        "user": user,
+        "tasks": all_data.get("global_tasks", []),
+        "maintenance": False
+    })
 
-# 2. ADD BALANCE
+# 2. EARNING (ADS/TASKS)
 @app.route('/api/add_balance', methods=['POST'])
 def add_balance():
-    if request.method == 'OPTIONS': return jsonify({'status': 'ok'}), 200
-
     req_data = request.json
     uid = str(req_data.get('user_id'))
     amount = float(req_data.get('amount'))
@@ -99,63 +105,24 @@ def add_balance():
     users = all_data.get("users", {})
     user = users.get(uid)
     
-    if not user:
-        user = {"user_id": uid, "first_name": "User", "balance": 0.00}
-    
+    if not user: return jsonify({"error": "User not found"}), 404
+    if user.get("banned", False): return jsonify({"error": "User is Banned"}), 403
+
+    # Update Balance
     user['balance'] = round(user.get('balance', 0) + amount, 2)
     
-    if amount == 0.50:
+    # Track Ad Stats
+    if amount == 0.50: # Assuming 0.50 is ad reward
         user['today_ads'] = user.get('today_ads', 0) + 1
         user['ads_watched_total'] = user.get('ads_watched_total', 0) + 1
-    
+        
     users[uid] = user
     all_data["users"] = users
     save_db(all_data)
     
     return jsonify({"status": "success", "new_balance": user['balance']})
 
-# 3. ADMIN ACTION
-@app.route('/api/admin/action', methods=['POST'])
-def admin_action():
-    req_data = request.json
-    admin_uid = str(req_data.get('admin_id'))
-    
-    if admin_uid != ADMIN_ID:
-        return jsonify({"error": "Unauthorized"}), 403
-        
-    action = req_data.get('action')
-    all_data = get_db()
-    
-    if action == "add_task":
-        tasks = all_data.get("global_tasks", [])
-        new_task = req_data.get('task')
-        new_task['id'] = int(time.time())
-        tasks.append(new_task)
-        all_data["global_tasks"] = tasks
-        save_db(all_data)
-        return jsonify({"status": "Task Added"})
-        
-    elif action == "send_money":
-        target_id = req_data.get('target_id')
-        amount = float(req_data.get('amount'))
-        users = all_data.get("users", {})
-        target = users.get(target_id)
-        if target:
-            target['balance'] = round(target.get('balance', 0) + amount, 2)
-            users[target_id] = target
-            all_data["users"] = users
-            save_db(all_data)
-            return jsonify({"status": "Money Sent"})
-        return jsonify({"error": "Target not found"})
-        
-    return jsonify({"error": "Invalid Action"})
-
-# 4. TASKS & WITHDRAWALS
-@app.route('/api/tasks', methods=['GET'])
-def get_tasks():
-    data = get_db()
-    return jsonify(data.get("global_tasks", []))
-
+# 3. WITHDRAWAL REQUEST
 @app.route('/api/withdraw', methods=['POST'])
 def withdraw():
     req_data = request.json
@@ -166,61 +133,114 @@ def withdraw():
     users = all_data.get("users", {})
     user = users.get(uid)
     
-    if not user or user.get('balance', 0) < amount:
-        return jsonify({"error": "Insufficient funds"}), 400
+    if not user: return jsonify({"error": "User not found"}), 404
+    if user.get("banned", False): return jsonify({"error": "Banned"}), 403
+    if user.get('balance', 0) < amount: return jsonify({"error": "Insufficient funds"}), 400
     
+    # Deduct Balance Immediately
     user['balance'] = round(user['balance'] - amount, 2)
     users[uid] = user
     
-    reqs = all_data.get("withdrawals", [])
-    req_data['status'] = "Pending"
-    req_data['date'] = str(time.time())
-    reqs.insert(0, req_data)
-    all_data["withdrawals"] = reqs
+    # Create Request Record
+    withdrawals = all_data.get("withdrawals", [])
+    new_req = {
+        "id": int(time.time()),
+        "user_id": uid,
+        "amount": amount,
+        "account": req_data.get('account'),
+        "method": req_data.get('method', 'Telebirr'),
+        "status": "Pending",
+        "date": time.ctime()
+    }
+    withdrawals.insert(0, new_req) # Add to top
     
+    all_data["withdrawals"] = withdrawals
+    all_data["users"] = users
     save_db(all_data)
     
-    return jsonify({"status": "success"})
+    return jsonify({"status": "success", "message": "Request Sent"})
 
-@app.route('/api/admin/withdrawals', methods=['GET'])
-def get_withdrawals():
-    data = get_db()
-    return jsonify(data.get("withdrawals", []))
-
-# --- WEBHOOK ---
-@app.route('/api/webhook', methods=['POST'])
-def webhook():
-    data = request.get_json(silent=True)
-    if not data or "message" not in data: return "OK"
+# 4. ADMIN PANEL ACTIONS
+@app.route('/api/admin/action', methods=['POST'])
+def admin_action():
+    req_data = request.json
+    admin_uid = str(req_data.get('admin_id'))
     
-    msg = data["message"]
-    chat_id = msg["chat"]["id"]
+    if admin_uid != ADMIN_ID: return jsonify({"error": "Unauthorized"}), 403
     
-    if "text" in msg and msg["text"].startswith("/start"):
-        uid = str(msg["from"]["id"])
-        first_name = msg["from"].get("first_name", "User")
+    action = req_data.get('action')
+    all_data = get_db()
+    
+    # --- TOGGLE MAINTENANCE ---
+    if action == "toggle_maintenance":
+        current = all_data.get("maintenance_mode", False)
+        all_data["maintenance_mode"] = not current
+        save_db(all_data)
+        return jsonify({"status": "Updated", "mode": all_data["maintenance_mode"]})
         
-        all_data = get_db()
+    # --- BAN USER ---
+    elif action == "ban_user":
+        target_id = req_data.get('target_id')
         users = all_data.get("users", {})
-        
-        if uid not in users:
-            users[uid] = {"user_id": uid, "first_name": first_name, "balance": 0.00}
+        if target_id in users:
+            users[target_id]['banned'] = not users[target_id].get('banned', False)
             all_data["users"] = users
             save_db(all_data)
+            return jsonify({"status": "Banned/Unbanned", "is_banned": users[target_id]['banned']})
+            
+    # --- WITHDRAWAL ACTION ---
+    elif action == "handle_withdrawal":
+        req_id = req_data.get('req_id')
+        decision = req_data.get('decision') # 'Approved' or 'Rejected'
+        withdrawals = all_data.get("withdrawals", [])
         
-        payload = {
-            "chat_id": chat_id,
-            "text": f"👋 Welcome {first_name}!",
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {"text": "🚀 Open App", "web_app": {"url": FRONTEND_URL}}
-                ]]
-            }
-        }
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=payload)
+        for w in withdrawals:
+            if w['id'] == req_id:
+                w['status'] = decision
+                # If rejected, refund money
+                if decision == "Rejected":
+                    users = all_data.get("users", {})
+                    if w['user_id'] in users:
+                        users[w['user_id']]['balance'] += w['amount']
+                        all_data["users"] = users
+                break
+        all_data["withdrawals"] = withdrawals
+        save_db(all_data)
+        return jsonify({"status": "Processed"})
 
+    # --- ADD TASK ---
+    elif action == "add_task":
+        tasks = all_data.get("global_tasks", [])
+        new_task = req_data.get('task')
+        new_task['id'] = int(time.time())
+        tasks.append(new_task)
+        all_data["global_tasks"] = tasks
+        save_db(all_data)
+        return jsonify({"status": "Task Added"})
+    
+    # --- GET ALL DATA ---
+    elif action == "get_full_data":
+        return jsonify(all_data)
+
+    return jsonify({"error": "Invalid Action"})
+
+# --- TELEGRAM WEBHOOK ---
+@app.route('/api/webhook', methods=['POST'])
+def webhook():
+    # Basic logic to reply to /start
+    data = request.get_json(silent=True)
+    if data and "message" in data:
+        msg = data["message"]
+        if "text" in msg and msg["text"].startswith("/start"):
+            chat_id = msg["chat"]["id"]
+            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "👋 Welcome to RiyalNet! Watch ads & Earn ETB.",
+                "reply_markup": {
+                    "inline_keyboard": [[{"text": "💸 Start Earning", "web_app": {"url": "https://net-ui-iota.vercel.app"}}]]
+                }
+            })
     return "OK"
 
-# For Vercel
 if __name__ == '__main__':
     app.run()
